@@ -1,0 +1,206 @@
+// Prisma schema for KDP Book Builder.
+// Dev datasource is SQLite for zero-setup local development.
+// To move to PostgreSQL: set `provider = "postgresql"` below and set
+// DATABASE_URL to a Postgres connection string, then run `npx prisma migrate dev`.
+// The schema avoids native `enum` types so it stays portable across both.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         String   @default("USER") // USER | ADMIN
+  plan         String   @default("FREE") // FREE | CREATOR | PRO
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  projects      Project[]
+  usageRecords  UsageRecord[]
+  subscription  Subscription?
+
+  @@index([email])
+}
+
+model Subscription {
+  id                   String    @id @default(cuid())
+  userId               String    @unique
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan                 String    @default("FREE") // FREE | CREATOR | PRO
+  status               String    @default("ACTIVE") // ACTIVE | CANCELED | PAST_DUE
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  currentPeriodEnd     DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  bookType  String // word_search | crossword | sudoku | maze | number_puzzle | kids_activity | coloring | journal | planner | log_book | notebook
+  status    String   @default("DRAFT") // DRAFT | GENERATING | READY | ARCHIVED
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  book             Book?
+  generationJobs   GenerationJob[]
+  exports          Export[]
+
+  @@index([userId])
+}
+
+model Book {
+  id            String  @id @default(cuid())
+  projectId     String  @unique
+  project       Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title         String
+  subtitle      String?
+  topic         String
+  audience      String
+  difficulty    String  @default("MEDIUM") // EASY | MEDIUM | HARD
+  description   String?
+  trimWidth     Float   @default(8.5)
+  trimHeight    Float   @default(11)
+  pageCount     Int
+  bleed         Boolean @default(false)
+  interiorColor String  @default("BW") // BW | COLOR
+  paperType     String  @default("WHITE") // WHITE | CREAM
+  coverFinish   String  @default("MATTE") // MATTE | GLOSSY
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  pages    Page[]
+  cover    Cover?
+  metadata Metadata?
+
+  @@index([projectId])
+}
+
+model Page {
+  id        String   @id @default(cuid())
+  bookId    String
+  book      Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  index     Int
+  type      String // word_search | crossword | sudoku | maze | ... | title | instructions | blank
+  title     String?
+  content   String // JSON-encoded structured page content
+  status    String   @default("PENDING") // PENDING | GENERATED | EDITED | ERROR
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  puzzle Puzzle?
+
+  @@unique([bookId, index])
+  @@index([bookId])
+}
+
+model Puzzle {
+  id         String  @id @default(cuid())
+  pageId     String  @unique
+  page       Page    @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  type       String
+  difficulty String  @default("MEDIUM")
+  data       String // JSON-encoded puzzle grid/state (never edited independently of solution)
+
+  solution PuzzleSolution?
+}
+
+model PuzzleSolution {
+  id       String @id @default(cuid())
+  puzzleId String @unique
+  puzzle   Puzzle @relation(fields: [puzzleId], references: [id], onDelete: Cascade)
+  data     String // JSON-encoded answer key, generated together with the puzzle
+}
+
+model Cover {
+  id              String   @id @default(cuid())
+  bookId          String   @unique
+  book            Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  title           String
+  subtitle        String?
+  author          String
+  frontImagePath  String?
+  backImagePath   String?
+  spineWidthIn    Float
+  fullWidthIn     Float
+  fullHeightIn    Float
+  colors          String // JSON array of hex colors
+  layout          String // JSON layout config
+  status          String   @default("DRAFT") // DRAFT | GENERATED
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model Metadata {
+  id           String   @id @default(cuid())
+  bookId       String   @unique
+  book         Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  title        String
+  subtitle     String?
+  description  String?
+  keywords     String // JSON array, up to 7
+  categories   String // JSON array of BISAC/category suggestions
+  audience     String?
+  features     String // JSON array of bullet features
+  backCoverText String?
+  updatedAt    DateTime @updatedAt
+}
+
+model GenerationJob {
+  id         String    @id @default(cuid())
+  projectId  String
+  project    Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  type       String // BOOK_GENERATE | PAGE_REGENERATE | COVER_GENERATE | METADATA_GENERATE | PDF_EXPORT
+  status     String    @default("QUEUED") // QUEUED | PROCESSING | VALIDATING | COMPLETED | FAILED
+  progress   Int       @default(0)
+  message    String?
+  input      String? // JSON-encoded request payload
+  result     String? // JSON-encoded result payload
+  error      String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  finishedAt DateTime?
+
+  @@index([projectId])
+  @@index([status])
+}
+
+model UsageRecord {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              String // AI_GENERATION | PDF_EXPORT
+  tokensInput       Int      @default(0)
+  tokensOutput      Int      @default(0)
+  estimatedCostCents Int     @default(0)
+  provider          String? // mock | openai
+  createdAt         DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+model Export {
+  id               String   @id @default(cuid())
+  projectId        String
+  project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  type             String // INTERIOR_PDF | COVER_PDF | FULL_PACKAGE
+  filePath         String
+  fileSizeBytes    Int      @default(0)
+  validationReport String // JSON-encoded validation report snapshot
+  createdAt        DateTime @default(now())
+
+  @@index([projectId])
+}
