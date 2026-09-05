@@ -33,7 +33,6 @@ src/
                               render-interior.ts, render-cover.ts (pdf-lib, vector output)
     validation/               book-validator.ts — the pre-export validation report
     auth/                     session.ts (JWT cookie), password.ts, service.ts, guard.ts, actions.ts
-    storage/                  FileStorage interface, LocalFileStorage, S3FileStorage
     limits/                   plans.ts, rate-limiter.ts, usage.ts (quota + burst limiting)
     billing/                  BillingProvider interface, NoopBillingProvider (Stripe-ready seam)
     db.ts                     Prisma client singleton (libSQL driver adapter)
@@ -60,8 +59,9 @@ change — the wizard, job pipeline, validation, and export all read from the re
 - **Auth:** Custom credentials (email/password, bcrypt + signed JWT session cookie) behind a
   `CredentialsAuthProvider` — structured so an OAuth provider can issue the same session later
   without touching the rest of the app.
-- **Storage:** `FileStorage` interface — `LocalFileStorage` (disk, default) or `S3FileStorage`
-  (AWS S3 or any S3-compatible endpoint), selected via `STORAGE_PROVIDER`.
+- **Storage:** none. Exported PDFs are rendered in memory per request and streamed straight to
+  the browser as a download (`lib/generation/pipeline.ts`'s `exportInteriorPdf`/`exportCoverPdf`) —
+  the app never writes a generated book to disk, S3, or the database.
 - **AI:** `AIProvider` interface — `MockProvider` (default, deterministic, free) or
   `OpenAIProvider` (used automatically when `OPENAI_API_KEY` is set). Add another vendor by
   implementing the same interface and branching in `lib/ai/index.ts`.
@@ -100,8 +100,6 @@ end-to-end (generation, PDF export, everything) with an empty `.env`.
 | `SESSION_SECRET` | **Yes, in production** | insecure dev fallback | Signs session JWTs |
 | `OPENAI_API_KEY` | No | unset → uses `MockProvider` | Enables real AI generation |
 | `OPENAI_TEXT_MODEL` / `OPENAI_IMAGE_MODEL` | No | `gpt-4o-mini` / `dall-e-3` | Model overrides |
-| `STORAGE_PROVIDER` | No | `local` | Set to `s3` for S3-compatible storage |
-| `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_PUBLIC_BASE_URL` | Only if `STORAGE_PROVIDER=s3` | — | S3 config |
 
 The AI API key is only ever read server-side (`lib/ai/openai-provider.ts`, imported from server
 actions and route handlers) — it's never bundled into client JavaScript.

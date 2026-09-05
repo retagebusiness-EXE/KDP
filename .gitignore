@@ -48,3 +48,6 @@ next-env.d.ts
 /prisma/*.db-journal
 *.db
 /storage/
+
+.vercel
+.env*

@@ -32,7 +32,7 @@ const WORD_BANKS: Record<string, string[]> = {
   food: [
     "PANCAKE", "AVOCADO", "PRETZEL", "CUPCAKE", "NOODLE", "PEPPER", "WAFFLE", "BURRITO",
     "OATMEAL", "PUMPKIN", "MUFFIN", "SANDWICH", "BISCUIT", "CASSEROLE", "SMOOTHIE",
-    "DUMPLING", "PANINI", "PRETZEL", "BROCCOLI", "LEMONADE",
+    "DUMPLING", "PANINI", "MEATBALL", "BROCCOLI", "LEMONADE",
   ],
   nature: [
     "FOREST", "MOUNTAIN", "WATERFALL", "MEADOW", "CANYON", "GLACIER", "VOLCANO", "PRAIRIE",
@@ -46,18 +46,68 @@ const WORD_BANKS: Record<string, string[]> = {
   ],
 };
 
-function pickWordBank(topic: string): string[] {
+function resolveTopicCategory(topic: string): keyof typeof WORD_BANKS {
   const key = topic.toLowerCase();
-  for (const [bank, words] of Object.entries(WORD_BANKS)) {
-    if (key.includes(bank)) return words;
+  for (const bank of Object.keys(WORD_BANKS) as (keyof typeof WORD_BANKS)[]) {
+    if (key.includes(bank)) return bank;
   }
-  if (/(basketball|soccer|football|tennis|golf|athlete)/.test(key)) return WORD_BANKS.sports;
-  if (/(animal|zoo|pet|wildlife)/.test(key)) return WORD_BANKS.animals;
-  if (/(sea|beach|fish|marine)/.test(key)) return WORD_BANKS.ocean;
-  if (/(star|planet|astro|galax)/.test(key)) return WORD_BANKS.space;
-  if (/(cook|recipe|kitchen|eat|meal)/.test(key)) return WORD_BANKS.food;
-  if (/(garden|hike|outdoor|camp)/.test(key)) return WORD_BANKS.nature;
-  return WORD_BANKS.general;
+  if (/(basketball|soccer|football|tennis|golf|athlete)/.test(key)) return "sports";
+  if (/(animal|zoo|pet|wildlife)/.test(key)) return "animals";
+  if (/(sea|beach|fish|marine)/.test(key)) return "ocean";
+  if (/(star|planet|astro|galax)/.test(key)) return "space";
+  if (/(cook|recipe|kitchen|eat|meal)/.test(key)) return "food";
+  if (/(garden|hike|outdoor|camp)/.test(key)) return "nature";
+  return "general";
+}
+
+function pickWordBank(topic: string): string[] {
+  return WORD_BANKS[resolveTopicCategory(topic)];
+}
+
+/** Whimsical, kid-friendly scene ideas per topic category, used so the mock provider's coloring pages vary page to page instead of just changing a number. */
+const COLORING_SUBJECTS: Record<keyof typeof WORD_BANKS, string[]> = {
+  sports: [
+    "a kid shooting a basketball hoop", "a puppy chasing a soccer ball", "a bear swinging a tennis racket",
+    "a robot playing hockey", "a squirrel at bat", "a fox dribbling a ball", "a turtle running a race",
+    "a rabbit holding a trophy",
+  ],
+  animals: [
+    "a bunny hopping through daisies", "a friendly dragon reading a book", "a bear fishing by a river",
+    "a giraffe wearing a scarf", "a penguin sledding downhill", "a fox flying a kite",
+    "an elephant blowing bubbles", "a koala napping in a tree",
+  ],
+  ocean: [
+    "a seahorse riding a wave", "a crab building a sandcastle", "an octopus playing a guitar",
+    "a dolphin jumping through a hoop", "a starfish sunbathing on a rock", "a turtle wearing a snorkel",
+    "a lobster having a picnic", "a whale spouting a fountain",
+  ],
+  space: [
+    "an astronaut planting a flag on the moon", "a rocket ship blasting off", "a friendly alien waving hello",
+    "a robot exploring a crater", "a comet zooming past stars", "a spaceship docking at a station",
+    "a rover collecting moon rocks", "a satellite orbiting a planet",
+  ],
+  food: [
+    "a smiling pancake stack", "a dancing ice cream cone", "a cupcake wearing a party hat",
+    "a happy watermelon slice", "a taco riding a skateboard", "a strawberry family picnic",
+    "a pizza wearing a superhero cape", "a donut floating on a cloud",
+  ],
+  nature: [
+    "a squirrel gathering acorns", "a butterfly landing on a flower", "a family of ducks on a pond",
+    "a treehouse in a big oak", "a rainbow over a meadow", "a hedgehog under a mushroom",
+    "a deer drinking from a stream", "a beehive with busy bees",
+  ],
+  general: [
+    "a knight riding a friendly dragon", "a wizard casting sparkly stars", "a pirate ship sailing to treasure",
+    "a fairy dancing on a mushroom", "a train chugging through the hills", "a hot air balloon over a village",
+    "a unicorn jumping over a rainbow", "a robot building a sandcastle",
+  ],
+};
+
+function pickColoringSubject(topic: string, ordinal: number, usedSubjects: string[], rng: () => number): string {
+  const bank = COLORING_SUBJECTS[resolveTopicCategory(topic)];
+  const used = new Set(usedSubjects.map((s) => s.toLowerCase()));
+  const shuffled = shuffle(rng, bank);
+  return shuffled.find((s) => !used.has(s.toLowerCase())) ?? `${topic} scene ${ordinal + 1}`;
 }
 
 function textUsage(prompt: string, output: string): AIUsage {
@@ -98,7 +148,13 @@ export class MockProvider implements AIProvider {
         const topic = String(ctx.topic ?? "general");
         const count = Number(ctx.count ?? 12);
         const bank = pickWordBank(topic);
-        data = shuffle(rng, bank).slice(0, Math.min(count, bank.length));
+        const usedWords = (ctx.usedWords as string[] | undefined) ?? [];
+        const used = new Set(usedWords.map((w) => w.toUpperCase()));
+        const fresh = shuffle(rng, bank.filter((w) => !used.has(w)));
+        // Bank exhausted (book has more pages than unique bank words) — top up with
+        // already-used words rather than erroring; still better than a hard cap.
+        const fallback = shuffle(rng, bank.filter((w) => used.has(w)));
+        data = [...fresh, ...fallback].slice(0, Math.min(count, bank.length));
         break;
       }
       case "crossword_clues": {
@@ -147,13 +203,15 @@ export class MockProvider implements AIProvider {
         break;
       }
       case "coloring_prompt": {
-        const variation = Number(ctx.ordinal ?? 0) + 1;
+        const topic = String(ctx.topic ?? "a friendly scene");
+        const audience = String(ctx.audience ?? "all ages");
+        const ordinal = Number(ctx.ordinal ?? 0);
+        const usedSubjects = (ctx.usedSubjects as string[] | undefined) ?? [];
+        const subject = pickColoringSubject(topic, ordinal, usedSubjects, rng);
         data = {
-          prompt: `Simple black-and-white line art coloring page (variation ${variation}), ${String(
-            ctx.topic ?? "a friendly scene"
-          )}, bold clean outlines, no shading, no text, original non-copyrighted design suitable for ${String(
-            ctx.audience ?? "all ages"
-          )}.`,
+          subject,
+          prompt: `Simple black-and-white line art coloring page of ${subject}, bold clean outlines, no shading, ` +
+            `no text, original non-copyrighted design suitable for ${audience}.`,
         };
         break;
       }

@@ -52,6 +52,8 @@ export function useJobPolling(jobId: string | null, onComplete?: (job: JobStatus
 }
 
 export function JobProgressCard({ job }: { job: JobStatus | null }) {
+  const [resuming, setResuming] = useState(false);
+
   if (!job) {
     return (
       <div className="rounded-lg border border-slate-200 bg-white p-4">
@@ -59,6 +61,18 @@ export function JobProgressCard({ job }: { job: JobStatus | null }) {
       </div>
     );
   }
+
+  const isStalled = job.status !== "COMPLETED" && job.status !== "FAILED" && job.message?.startsWith("Paused");
+
+  async function resume() {
+    setResuming(true);
+    try {
+      await fetch(`/api/jobs/${job!.id}/resume`, { method: "POST" });
+    } finally {
+      setResuming(false);
+    }
+  }
+
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-4">
       <div className="mb-2 flex items-center justify-between">
@@ -67,6 +81,16 @@ export function JobProgressCard({ job }: { job: JobStatus | null }) {
       </div>
       <ProgressBar value={job.progress} />
       {job.status === "FAILED" && <p className="mt-2 text-sm text-red-600">{job.error}</p>}
+      {isStalled && (
+        <button
+          type="button"
+          onClick={resume}
+          disabled={resuming}
+          className="mt-2 rounded-md border border-slate-300 px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        >
+          {resuming ? "Resuming…" : "Resume generation"}
+        </button>
+      )}
     </div>
   );
 }

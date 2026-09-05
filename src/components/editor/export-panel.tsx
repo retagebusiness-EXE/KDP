@@ -4,25 +4,43 @@ import { useState } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { useJobPolling, JobProgressCard } from "@/components/jobs/job-progress";
 import type { ValidationReport } from "@/lib/validation/types";
 
-export interface ExportRecord {
-  id: string;
-  type: string;
-  fileSizeBytes: number;
-  createdAt: string;
-  downloadUrl: string;
+type ExportKind = "INTERIOR_PDF" | "COVER_PDF" | "FULL_PACKAGE";
+
+function filenameFromResponse(res: Response, fallback: string): string {
+  const match = res.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/);
+  return match?.[1] ?? fallback;
 }
 
-export function ExportPanel({ projectId, hasCover, initialExports }: { projectId: string; hasCover: boolean; initialExports: ExportRecord[] }) {
+/** Downloads a PDF straight from the response into the browser — the file only ever exists in memory here, never on the server. */
+async function downloadPdf(endpoint: string, projectId: string, fallbackName: string) {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error ?? "Export failed.");
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filenameFromResponse(res, fallbackName);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export function ExportPanel({ projectId, hasCover }: { projectId: string; hasCover: boolean }) {
   const [report, setReport] = useState<ValidationReport | null>(null);
   const [validating, setValidating] = useState(false);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [exports, setExports] = useState(initialExports);
+  const [exporting, setExporting] = useState<ExportKind | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [resultUrls, setResultUrls] = useState<Record<string, string> | null>(null);
+  const [downloaded, setDownloaded] = useState<ExportKind | null>(null);
 
   async function runValidation() {
     setValidating(true);
@@ -41,31 +59,23 @@ export function ExportPanel({ projectId, hasCover, initialExports }: { projectId
     setReport(data.report);
   }
 
-  const job = useJobPolling(jobId, async (finished) => {
-    setJobId(null);
-    if (finished.status === "COMPLETED") {
-      const result = finished.result as { validation: ValidationReport; urls: Record<string, string> } | null;
-      if (result?.validation) setReport(result.validation);
-      if (result?.urls) setResultUrls(result.urls);
-      const res = await fetch(`/api/projects/${projectId}/exports`);
-      if (res.ok) setExports((await res.json()).exports);
-    } else {
-      setError(finished.error ?? "Export failed.");
-    }
-  });
-
-  async function startExport(type: "INTERIOR_PDF" | "FULL_PACKAGE" | "COVER_PDF") {
+  async function startExport(kind: ExportKind) {
     setError(null);
-    setResultUrls(null);
-    const endpoint = type === "COVER_PDF" ? "/api/export/cover" : "/api/export/pdf";
-    const body = type === "COVER_PDF" ? { projectId } : { projectId, type };
-    const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const data = await res.json();
-    if (!res.ok) {
-      setError(data.error ?? "Could not start export.");
-      return;
+    setDownloaded(null);
+    setExporting(kind);
+    try {
+      if (kind === "INTERIOR_PDF" || kind === "FULL_PACKAGE") {
+        await downloadPdf("/api/export/pdf", projectId, "interior.pdf");
+      }
+      if (kind === "COVER_PDF" || kind === "FULL_PACKAGE") {
+        await downloadPdf("/api/export/cover", projectId, "cover.pdf");
+      }
+      setDownloaded(kind);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not export.");
+    } finally {
+      setExporting(null);
     }
-    setJobId(data.jobId);
   }
 
   return (
@@ -74,6 +84,9 @@ export function ExportPanel({ projectId, hasCover, initialExports }: { projectId
         ← Back to editor
       </Link>
       <h1 className="text-2xl font-semibold text-slate-900">Export</h1>
+      <p className="text-sm text-slate-500">
+        Files are generated on demand and download straight to your device — nothing is stored on our servers.
+      </p>
 
       <Card>
         <CardHeader>
@@ -123,63 +136,23 @@ export function ExportPanel({ projectId, hasCover, initialExports }: { projectId
 
       <Card>
         <CardHeader>
-          <CardTitle>Export files</CardTitle>
+          <CardTitle>Download</CardTitle>
         </CardHeader>
         <CardBody className="space-y-3">
           {error && <p className="text-sm text-red-600">{error}</p>}
-          {jobId ? (
-            <JobProgressCard job={job} />
-          ) : (
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={() => startExport("INTERIOR_PDF")}>Export Interior PDF</Button>
-              <Button onClick={() => startExport("COVER_PDF")} disabled={!hasCover} variant="secondary">
-                Export Cover PDF
-              </Button>
-              <Button onClick={() => startExport("FULL_PACKAGE")} disabled={!hasCover} variant="secondary">
-                Export Full Package
-              </Button>
-            </div>
-          )}
-          {!hasCover && <p className="text-xs text-slate-500">Generate a cover first to unlock cover / full-package exports.</p>}
-          {resultUrls && (
-            <div className="flex flex-wrap gap-3 rounded-lg bg-emerald-50 p-3 text-sm">
-              {resultUrls.interior && (
-                <a href={resultUrls.interior} className="font-medium text-emerald-700 underline" download>
-                  Download interior PDF
-                </a>
-              )}
-              {resultUrls.cover && (
-                <a href={resultUrls.cover} className="font-medium text-emerald-700 underline" download>
-                  Download cover PDF
-                </a>
-              )}
-            </div>
-          )}
-        </CardBody>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Export history</CardTitle>
-        </CardHeader>
-        <CardBody>
-          {exports.length === 0 ? (
-            <p className="text-sm text-slate-500">No exports yet.</p>
-          ) : (
-            <ul className="divide-y divide-slate-100 text-sm">
-              {exports.map((e) => (
-                <li key={e.id} className="flex items-center justify-between py-2">
-                  <div>
-                    <Badge tone="indigo">{e.type.replace("_", " ")}</Badge>
-                    <span className="ml-2 text-xs text-slate-500">{(e.fileSizeBytes / 1024).toFixed(0)} KB</span>
-                  </div>
-                  <a href={e.downloadUrl} className="text-indigo-600 hover:text-indigo-500" download>
-                    Download
-                  </a>
-                </li>
-              ))}
-            </ul>
-          )}
+          {downloaded && !exporting && <p className="text-sm text-emerald-700">Download started.</p>}
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => startExport("INTERIOR_PDF")} disabled={exporting !== null}>
+              {exporting === "INTERIOR_PDF" ? "Preparing..." : "Download Interior PDF"}
+            </Button>
+            <Button onClick={() => startExport("COVER_PDF")} disabled={!hasCover || exporting !== null} variant="secondary">
+              {exporting === "COVER_PDF" ? "Preparing..." : "Download Cover PDF"}
+            </Button>
+            <Button onClick={() => startExport("FULL_PACKAGE")} disabled={!hasCover || exporting !== null} variant="secondary">
+              {exporting === "FULL_PACKAGE" ? "Preparing..." : "Download Both"}
+            </Button>
+          </div>
+          {!hasCover && <p className="text-xs text-slate-500">Generate a cover first to unlock cover / both-file downloads.</p>}
         </CardBody>
       </Card>
     </div>

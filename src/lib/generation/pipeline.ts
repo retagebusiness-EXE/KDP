@@ -1,16 +1,17 @@
 import "server-only";
 import { prisma } from "@/lib/db";
 import { getAIProvider, providerCostKey } from "@/lib/ai";
+import { TEXT_TIMEOUT_MS, IMAGE_TIMEOUT_MS } from "@/lib/ai/openai-provider";
 import type { AIUsage } from "@/lib/ai/types";
 import { checkOriginality } from "@/lib/ai/safety";
 import { recordAIUsage } from "@/lib/limits/usage";
 import { calculateCoverDimensions, type InteriorColor, type PaperType } from "@/lib/pdf/dimensions";
 import { renderInteriorPdf, type InteriorPageInput } from "@/lib/pdf/render-interior";
 import { renderCoverPdf } from "@/lib/pdf/render-cover";
-import { getFileStorage } from "@/lib/storage";
 import { validateBook, type ValidationPageInput } from "@/lib/validation";
 import { getBookTypeConfig, type BookTypeId } from "./book-types";
 import { computeBookStructure } from "./structure";
+import { ExportBlockedError } from "./errors";
 import {
   generateAnswerKeyPage,
   generatePageContent,
@@ -19,7 +20,7 @@ import {
   type BookContext,
   type GeneratedPage,
 } from "./content";
-import type { CoverGenerateRequest, ExportRequest } from "./schemas";
+import type { CoverGenerateRequest } from "./schemas";
 
 const ZERO_USAGE: AIUsage = { inputTokens: 0, outputTokens: 0 };
 function addUsage(a: AIUsage, b: AIUsage): AIUsage {
@@ -45,6 +46,48 @@ async function updateJob(jobId: string, update: JobUpdate) {
   });
 }
 
+/** Shared secret gating `POST /api/jobs/:id/continue` — an unauthenticated,
+ * server-to-server-only endpoint (see scheduleContinuation below). */
+export function getInternalJobSecret(): string {
+  const secret = process.env.INTERNAL_JOB_SECRET;
+  if (!secret) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("INTERNAL_JOB_SECRET must be set in production.");
+    }
+    return "dev-only-insecure-secret-change-me";
+  }
+  return secret;
+}
+
+/**
+ * Hands an in-progress job off to a brand-new serverless invocation (its own
+ * fresh maxDuration budget) by calling the app's own continuation endpoint.
+ * Fire-and-forget from the caller's perspective — we only await the 202
+ * acknowledgment, not the work it kicks off via `after()` on the other end.
+ */
+async function scheduleContinuation(jobId: string): Promise<void> {
+  // VERCEL_URL is the per-deployment hostname (kdp-<hash>-team.vercel.app) — this
+  // project's Deployment Protection (SSO) covers every such URL except the
+  // project's actual assigned domain, so a self-fetch to VERCEL_URL gets
+  // intercepted by Vercel's auth wall instead of reaching our route handler.
+  // VERCEL_PROJECT_PRODUCTION_URL is that assigned domain and isn't protected.
+  const host = process.env.VERCEL_PROJECT_PRODUCTION_URL ?? process.env.VERCEL_URL;
+  const base = host ? `https://${host}` : "http://localhost:3000";
+  try {
+    const res = await fetch(`${base}/api/jobs/${jobId}/continue`, {
+      method: "POST",
+      headers: { "x-internal-job-secret": getInternalJobSecret() },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`continuation request failed: ${res.status} ${body.slice(0, 300)}`);
+    }
+  } catch (err) {
+    console.error("[job] failed to schedule continuation", err);
+    await updateJob(jobId, { message: "Paused — will resume shortly." });
+  }
+}
+
 /**
  * Single entry point the job queue calls. Dispatches on `job.type` to the
  * right runner below. A future BullMQ worker would import this same
@@ -57,7 +100,7 @@ export async function runGenerationJob(jobId: string): Promise<void> {
   try {
     switch (job.type) {
       case "BOOK_GENERATE":
-        await runBookGenerate(job.id, job.projectId);
+        await runBookGenerate(job.id, job.projectId, job.status === "PROCESSING");
         break;
       case "PAGE_REGENERATE":
         await runPageRegenerate(job.id, job.projectId, JSON.parse(job.input ?? "{}"));
@@ -67,9 +110,6 @@ export async function runGenerationJob(jobId: string): Promise<void> {
         break;
       case "METADATA_GENERATE":
         await runMetadataGenerate(job.id, job.projectId);
-        break;
-      case "PDF_EXPORT":
-        await runExport(job.id, job.projectId, JSON.parse(job.input ?? "{}"));
         break;
       default:
         await updateJob(jobId, { status: "FAILED", error: `Unknown job type: ${job.type}`, finishedAt: new Date() });
@@ -87,18 +127,39 @@ export async function runGenerationJob(jobId: string): Promise<void> {
 // BOOK_GENERATE
 // ---------------------------------------------------------------------------
 
-async function runBookGenerate(jobId: string, projectId: string): Promise<void> {
+// Vercel hard-kills a serverless invocation at `maxDuration` (60s) regardless of
+// any try/catch — a book with several content pages (each a sequential text
+// call, plus an image call for coloring pages) routinely runs longer than
+// that. Rather than a flat time budget (a single page's own AI calls can
+// approach the 60s ceiling on their own — a flat "45s elapsed" check could
+// still greenlight a page that then overruns), check elapsed time *plus* the
+// worst case for one more page before starting it, so we never start a page
+// we can't be sure will finish. Coloring pages pay for an image call too, so
+// their worst case is higher — see TEXT_TIMEOUT_MS/IMAGE_TIMEOUT_MS in
+// openai-provider.ts, the actual per-request caps this is sized against.
+// The rest hands off to a fresh invocation (its own full 60s budget) via a
+// self-continuation request. Resuming reads already-persisted pages back out
+// of the DB instead of carrying state in memory.
+const SAFE_INVOCATION_MS = 57_000;
+const OVERHEAD_MS = 3_000;
+const WORST_CASE_TEXT_PAGE_MS = TEXT_TIMEOUT_MS + OVERHEAD_MS;
+const WORST_CASE_COLORING_PAGE_MS = TEXT_TIMEOUT_MS + IMAGE_TIMEOUT_MS + OVERHEAD_MS;
+
+async function runBookGenerate(jobId: string, projectId: string, isResume: boolean): Promise<void> {
   const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId }, include: { book: true, user: true } });
   const book = project.book;
   if (!book) throw new Error("Project has no book configuration yet.");
 
-  const originality = checkOriginality(book.title, book.topic, book.description ?? undefined);
-  if (originality.flagged) {
-    throw new Error(originality.message);
+  if (!isResume) {
+    const originality = checkOriginality(book.title, book.topic, book.description ?? undefined);
+    if (originality.flagged) {
+      throw new Error(originality.message);
+    }
+    await updateJob(jobId, { status: "PROCESSING", progress: 5, message: "Generating content..." });
+    await prisma.page.deleteMany({ where: { bookId: book.id } });
   }
 
-  await updateJob(jobId, { status: "PROCESSING", progress: 5, message: "Generating content..." });
-  await prisma.page.deleteMany({ where: { bookId: book.id } });
+  const existingPages = isResume ? await prisma.page.findMany({ where: { bookId: book.id } }) : [];
 
   const structure = computeBookStructure(project.bookType as BookTypeId, book.pageCount);
   const ai = getAIProvider();
@@ -113,9 +174,28 @@ async function runBookGenerate(jobId: string, projectId: string): Promise<void> 
     trimHeightIn: book.trimHeight,
   };
 
+  const existingByIndex = new Map(existingPages.map((p) => [p.index, p]));
   let totalUsage: AIUsage = ZERO_USAGE;
+  const usedColoringSubjects: string[] = [];
+  const usedWords: string[] = [];
+  for (const p of existingPages) {
+    const content = JSON.parse(p.content) as { subject?: string; words?: string[] };
+    if (content.subject) usedColoringSubjects.push(content.subject);
+    if (content.words) usedWords.push(...content.words);
+  }
 
+  const worstCasePageMs =
+    (project.bookType as BookTypeId) === "coloring" ? WORST_CASE_COLORING_PAGE_MS : WORST_CASE_TEXT_PAGE_MS;
+
+  const startedAt = Date.now();
   for (const plan of structure.pages) {
+    if (existingByIndex.has(plan.index)) continue;
+
+    if (Date.now() - startedAt + worstCasePageMs > SAFE_INVOCATION_MS) {
+      await scheduleContinuation(jobId);
+      return;
+    }
+
     if (plan.kind === "title") {
       const generated = await generateTitlePageContent(ctx, ai);
       await persistPage(book.id, plan.index, generated);
@@ -128,9 +208,15 @@ async function runBookGenerate(jobId: string, projectId: string): Promise<void> 
         message: "Building puzzles...",
       });
       const seed = `${book.id}:${plan.index}`;
-      const generated = await generatePageContent(ctx, plan.ordinal, seed, ai);
+      const generated = await generatePageContent(ctx, plan.ordinal, seed, ai, usedColoringSubjects, usedWords);
       await persistPage(book.id, plan.index, generated);
       totalUsage = addUsage(totalUsage, generated.usage);
+      const subject = (generated.content as { subject?: string }).subject;
+      if (subject) usedColoringSubjects.push(subject);
+      if (generated.type === "word_search") {
+        const words = (generated.content as { words?: string[] }).words;
+        if (words) usedWords.push(...words);
+      }
       continue;
     }
     if (plan.kind === "blank") {
@@ -145,6 +231,9 @@ async function runBookGenerate(jobId: string, projectId: string): Promise<void> 
     await rebuildAnswerKeyPages(book.id, project.bookType as BookTypeId);
   }
 
+  // ponytail: totalUsage only covers pages generated in this invocation — a job resumed
+  // after a continuation under-counts the pages an earlier, timed-out invocation already
+  // persisted. Fix if usage billing needs to be exact: persist per-page usage on Page/Puzzle.
   if (totalUsage.inputTokens + totalUsage.outputTokens > 0) {
     await recordAIUsage(project.userId, ai.name, providerCostKey(ai), totalUsage);
   }
@@ -293,7 +382,32 @@ async function runPageRegenerate(jobId: string, projectId: string, input: { page
   };
   const ai = getAIProvider();
   const seed = `${book.id}:${page.index}:regen:${Date.now()}`;
-  const generated = await generatePageContent(ctx, ordinal, seed, ai);
+
+  let usedColoringSubjects: string[] = [];
+  if (project.bookType === "coloring") {
+    const siblings = await prisma.page.findMany({ where: { bookId: book.id, type: "coloring", id: { not: page.id } } });
+    usedColoringSubjects = siblings
+      .map((p) => {
+        try {
+          return (JSON.parse(p.content) as { subject?: string }).subject;
+        } catch {
+          return undefined;
+        }
+      })
+      .filter((s): s is string => Boolean(s));
+  }
+  let usedWords: string[] = [];
+  if (project.bookType === "word_search" || project.bookType === "kids_activity") {
+    const siblings = await prisma.page.findMany({ where: { bookId: book.id, type: "word_search", id: { not: page.id } } });
+    usedWords = siblings.flatMap((p) => {
+      try {
+        return (JSON.parse(p.content) as { words?: string[] }).words ?? [];
+      } catch {
+        return [];
+      }
+    });
+  }
+  const generated = await generatePageContent(ctx, ordinal, seed, ai, usedColoringSubjects, usedWords);
 
   await prisma.puzzleSolution.deleteMany({ where: { puzzle: { pageId: page.id } } });
   await prisma.puzzle.deleteMany({ where: { pageId: page.id } });
@@ -459,74 +573,67 @@ async function runMetadataGenerate(jobId: string, projectId: string): Promise<vo
 }
 
 // ---------------------------------------------------------------------------
-// PDF_EXPORT
+// PDF export — synchronous, in-memory only. Rendered bytes are streamed
+// straight back to the caller's HTTP response and never written to disk,
+// S3, or the database: the app does not retain generated files. Only a
+// small metadata row (type/size/validation snapshot) is kept, for plan
+// quota counting and admin stats.
 // ---------------------------------------------------------------------------
 
-async function runExport(jobId: string, projectId: string, input: ExportRequest): Promise<void> {
-  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId }, include: { book: { include: { cover: true } }, user: true } });
+function sanitizeFilename(name: string): string {
+  return name.trim().replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase() || "book";
+}
+
+export async function exportInteriorPdf(projectId: string): Promise<{ bytes: Uint8Array; filename: string }> {
+  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId }, include: { book: true } });
   const book = project.book;
   if (!book) throw new Error("Project has no book configuration yet.");
 
-  await updateJob(jobId, { status: "VALIDATING", progress: 10, message: "Validating pages..." });
   const report = await validateProjectBook(projectId);
   if (!report.ok) {
-    throw new Error(`Export blocked by validation errors: ${report.errors.map((e) => e.message).join(" | ")}`);
+    throw new ExportBlockedError(`Export blocked by validation errors: ${report.errors.map((e) => e.message).join(" | ")}`);
   }
 
-  await updateJob(jobId, { status: "PROCESSING", progress: 40, message: "Rendering PDF..." });
-  const storage = getFileStorage();
-  const timestamp = Date.now();
-  const exportIds: Record<string, string> = {};
-  const urls: Record<string, string> = {};
+  const pages = await prisma.page.findMany({ where: { bookId: book.id }, orderBy: { index: "asc" } });
+  const interiorPages: InteriorPageInput[] = pages.map((p) => ({ index: p.index, type: p.type, content: JSON.parse(p.content) }));
+  const bytes = await renderInteriorPdf({ trimWidthIn: book.trimWidth, trimHeightIn: book.trimHeight }, interiorPages);
 
-  if (input.type === "INTERIOR_PDF" || input.type === "FULL_PACKAGE") {
-    const pages = await prisma.page.findMany({ where: { bookId: book.id }, orderBy: { index: "asc" } });
-    const interiorPages: InteriorPageInput[] = pages.map((p) => ({ index: p.index, type: p.type, content: JSON.parse(p.content) }));
-    const bytes = await renderInteriorPdf({ trimWidthIn: book.trimWidth, trimHeightIn: book.trimHeight }, interiorPages);
-    const key = `${project.userId}/exports/${projectId}/interior-${timestamp}.pdf`;
-    await storage.put(key, Buffer.from(bytes), { contentType: "application/pdf" });
-    const rec = await prisma.export.create({
-      data: { projectId, type: "INTERIOR_PDF", filePath: key, fileSizeBytes: bytes.byteLength, validationReport: JSON.stringify(report) },
-    });
-    exportIds.interior = rec.id;
-    urls.interior = storage.urlFor(key);
-  }
-
-  if (input.type === "COVER_PDF" || input.type === "FULL_PACKAGE") {
-    if (!book.cover) throw new Error("Generate a cover before exporting it.");
-    await updateJob(jobId, { progress: 70, message: "Rendering cover..." });
-    const colors = JSON.parse(book.cover.colors) as string[];
-    const bytes = await renderCoverPdf({
-      title: book.cover.title,
-      subtitle: book.cover.subtitle ?? undefined,
-      author: book.cover.author,
-      backCoverText: undefined,
-      colors,
-      dimensions: {
-        trimWidthIn: book.trimWidth,
-        trimHeightIn: book.trimHeight,
-        pageCount: await prisma.page.count({ where: { bookId: book.id } }),
-        paperType: book.paperType as PaperType,
-        interiorColor: book.interiorColor as InteriorColor,
-        bleed: book.bleed,
-      },
-    });
-    const key = `${project.userId}/exports/${projectId}/cover-${timestamp}.pdf`;
-    await storage.put(key, Buffer.from(bytes), { contentType: "application/pdf" });
-    const rec = await prisma.export.create({
-      data: { projectId, type: "COVER_PDF", filePath: key, fileSizeBytes: bytes.byteLength, validationReport: JSON.stringify(report) },
-    });
-    exportIds.cover = rec.id;
-    urls.cover = storage.urlFor(key);
-  }
-
-  await updateJob(jobId, {
-    status: "COMPLETED",
-    progress: 100,
-    message: "Export ready.",
-    result: { exportIds, urls, validation: report },
-    finishedAt: new Date(),
+  await prisma.export.create({
+    data: { projectId, type: "INTERIOR_PDF", fileSizeBytes: bytes.byteLength, validationReport: JSON.stringify(report) },
   });
+
+  return { bytes, filename: `${sanitizeFilename(book.title)}-interior.pdf` };
+}
+
+export async function exportCoverPdf(projectId: string): Promise<{ bytes: Uint8Array; filename: string }> {
+  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId }, include: { book: { include: { cover: true } } } });
+  const book = project.book;
+  if (!book) throw new Error("Project has no book configuration yet.");
+  if (!book.cover) throw new Error("Generate a cover before exporting it.");
+
+  const report = await validateProjectBook(projectId);
+  const colors = JSON.parse(book.cover.colors) as string[];
+  const bytes = await renderCoverPdf({
+    title: book.cover.title,
+    subtitle: book.cover.subtitle ?? undefined,
+    author: book.cover.author,
+    backCoverText: undefined,
+    colors,
+    dimensions: {
+      trimWidthIn: book.trimWidth,
+      trimHeightIn: book.trimHeight,
+      pageCount: await prisma.page.count({ where: { bookId: book.id } }),
+      paperType: book.paperType as PaperType,
+      interiorColor: book.interiorColor as InteriorColor,
+      bleed: book.bleed,
+    },
+  });
+
+  await prisma.export.create({
+    data: { projectId, type: "COVER_PDF", fileSizeBytes: bytes.byteLength, validationReport: JSON.stringify(report) },
+  });
+
+  return { bytes, filename: `${sanitizeFilename(book.title)}-cover.pdf` };
 }
 
 // ---------------------------------------------------------------------------

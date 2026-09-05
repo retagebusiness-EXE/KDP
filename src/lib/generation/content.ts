@@ -80,11 +80,13 @@ export async function generatePageContent(
   ctx: BookContext,
   ordinal: number,
   seed: string,
-  ai: AIProvider
+  ai: AIProvider,
+  usedColoringSubjects: string[] = [],
+  usedWords: string[] = []
 ): Promise<GeneratedPage> {
   switch (ctx.bookType) {
     case "word_search":
-      return generateWordSearchPage(ctx, ordinal, seed, ai, ctx.difficulty);
+      return generateWordSearchPage(ctx, ordinal, seed, ai, ctx.difficulty, undefined, usedWords);
     case "crossword":
       return generateCrosswordPage(ctx, ordinal, seed, ai);
     case "sudoku":
@@ -94,10 +96,10 @@ export async function generatePageContent(
       return generateMazePage(ctx, ordinal, seed, ctx.difficulty);
     case "kids_activity":
       return ordinal % 2 === 0
-        ? generateWordSearchPage(ctx, ordinal, seed, ai, "EASY", 6)
+        ? generateWordSearchPage(ctx, ordinal, seed, ai, "EASY", 6, usedWords)
         : generateMazePage(ctx, ordinal, seed, "EASY");
     case "coloring":
-      return generateColoringPage(ctx, ordinal, seed, ai);
+      return generateColoringPage(ctx, ordinal, seed, ai, usedColoringSubjects);
     case "journal":
       return generateJournalPage(ctx, ordinal, seed, ai);
     case "planner":
@@ -117,14 +119,18 @@ async function generateWordSearchPage(
   seed: string,
   ai: AIProvider,
   difficulty: Difficulty,
-  wordCountOverride?: number
+  wordCountOverride?: number,
+  usedWords: string[] = []
 ): Promise<GeneratedPage> {
   const count = wordCountOverride ?? wordCountFor(difficulty);
+  const avoidance = usedWords.length
+    ? ` Do not repeat any of these words already used elsewhere in this same book: ${usedWords.join(", ")}.`
+    : "";
   const { data: words, usage } = await ai.generateJSON<string[]>(
     `Generate ${count} distinct single words or short phrases (3-12 letters, no spaces) related to ` +
-      `"${ctx.topic}" for page ${ordinal + 1} of a word search puzzle book aimed at ${ctx.audience}. ` +
+      `"${ctx.topic}" for page ${ordinal + 1} of a word search puzzle book aimed at ${ctx.audience}.${avoidance} ` +
       `Return only the words. ${ORIGINALITY_INSTRUCTION}`,
-    { mockKind: "word_list", mockContext: { topic: ctx.topic, count, ordinal } }
+    { mockKind: "word_list", mockContext: { topic: ctx.topic, count, ordinal, usedWords } }
   );
 
   const title = `${ctx.topic} #${ordinal + 1}`;
@@ -237,25 +243,70 @@ export function coloringImagePixelSize(ctx: BookContext): { width: number; heigh
   return { width: Math.round(rawWidth * scale), height: Math.round(rawHeight * scale) };
 }
 
+/**
+ * Kids' coloring books need line complexity matched to the reader's age — a
+ * toddler can't stay inside thin, detailed lines. Audience strings are free
+ * text ("Kids ages 3-8"), so this is a best-effort heuristic, not a parser.
+ */
+function coloringAgeBand(audience: string): { styleInstruction: string } {
+  const nums = audience.match(/\d+/g)?.map(Number) ?? [];
+  const maxAge = nums.length ? Math.max(...nums) : 8;
+  const key = audience.toLowerCase();
+  if (/(toddler|preschool)/.test(key) || maxAge <= 4) {
+    return {
+      styleInstruction:
+        "Use extra-thick, very simple outlines with one single large, chunky object filling most of the page " +
+        "and almost no small details — easy for a toddler to color inside the lines.",
+    };
+  }
+  if (maxAge <= 9) {
+    return {
+      styleInstruction:
+        "Use thick, bold outlines with a simple, uncluttered composition and moderate detail — easy for a " +
+        "young child to color inside the lines.",
+    };
+  }
+  return {
+    styleInstruction:
+      "Use clean medium-weight outlines with richer scene detail and a few background elements — engaging " +
+      "for an older child to color.",
+  };
+}
+
 async function generateColoringPage(
   ctx: BookContext,
   ordinal: number,
   seed: string,
-  ai: AIProvider
+  ai: AIProvider,
+  usedSubjects: string[]
 ): Promise<GeneratedPage> {
-  const { data, usage: promptUsage } = await ai.generateJSON<{ prompt: string }>(
-    `Describe a simple black-and-white line-art coloring page illustration (variation ${ordinal + 1}) about ` +
-      `"${ctx.topic}" for ${ctx.audience}. Bold clean pure-black outlines on a white background, no shading, ` +
-      `no gray tones, no color, no text or lettering in the image, leave a small margin of white space around ` +
-      `the artwork so nothing touches the edge. ${ORIGINALITY_INSTRUCTION}`,
-    { mockKind: "coloring_prompt", mockContext: { topic: ctx.topic, audience: ctx.audience, ordinal } }
+  const ageBand = coloringAgeBand(ctx.audience);
+  const avoidance = usedSubjects.length
+    ? ` Do not repeat any of these subjects/scenes already used elsewhere in this same book: ` +
+      `${usedSubjects.slice(-8).join("; ")}. The scene must be clearly different from all of them.`
+    : "";
+
+  const { data, usage: promptUsage } = await ai.generateJSON<{ subject: string; prompt: string }>(
+    `Invent one original, specific scene for page ${ordinal + 1} of a kids coloring book about "${ctx.topic}", ` +
+      `suitable for ${ctx.audience}.${avoidance} Then write it as an image-generation prompt for a ` +
+      `black-and-white line-art coloring page: ${ageBand.styleInstruction} Bold clean pure-black outlines on a ` +
+      `white background, no shading, no gray tones, no color fills, no text or lettering, leave a small white ` +
+      `margin around the artwork so nothing touches the edge. Return a JSON object with "subject" (a short ` +
+      `3-6 word label for the scene, e.g. "fox flying a kite") and "prompt" (the full illustration description). ` +
+      `${ORIGINALITY_INSTRUCTION}`,
+    {
+      mockKind: "coloring_prompt",
+      mockContext: { topic: ctx.topic, audience: ctx.audience, ordinal, usedSubjects },
+      temperature: 0.9,
+    }
   );
-  const title = `${ctx.topic} #${ordinal + 1}`;
+  const subject = (data.subject || `${ctx.topic} scene`).trim();
+  const title = subject.charAt(0).toUpperCase() + subject.slice(1);
   const image = await ai.generateImage(data.prompt, coloringImagePixelSize(ctx));
   return {
     type: "coloring",
     title,
-    content: { imageUrl: image.url, title, prompt: data.prompt },
+    content: { imageUrl: image.url, title, prompt: data.prompt, subject },
     usage: { inputTokens: promptUsage.inputTokens + image.usage.inputTokens, outputTokens: promptUsage.outputTokens + image.usage.outputTokens },
   };
 }

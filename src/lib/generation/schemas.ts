@@ -42,12 +42,6 @@ export const metadataGenerateSchema = z.object({
 });
 export type MetadataGenerateRequest = z.infer<typeof metadataGenerateSchema>;
 
-export const exportSchema = z.object({
-  projectId: z.string().min(1),
-  type: z.enum(["INTERIOR_PDF", "COVER_PDF", "FULL_PACKAGE"]),
-});
-export type ExportRequest = z.infer<typeof exportSchema>;
-
 export const projectCreateSchema = z.object({
   name: z.string().trim().min(1).max(200),
   bookType: z.enum(BOOK_TYPE_IDS as [string, ...string[]]),

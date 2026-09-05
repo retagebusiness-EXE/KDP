@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { ForbiddenError, UnauthorizedError } from "@/lib/auth/guard";
 import { UsageLimitError } from "@/lib/limits/usage";
+import { ExportBlockedError } from "@/lib/generation/errors";
 
 /**
  * Wraps a route handler so every API route gets the same error-to-status
@@ -21,6 +22,9 @@ export function withApiErrors(handler: () => Promise<NextResponse>): Promise<Nex
     }
     if (err instanceof UsageLimitError) {
       return NextResponse.json({ error: err.message }, { status: 429 });
+    }
+    if (err instanceof ExportBlockedError) {
+      return NextResponse.json({ error: err.message }, { status: 422 });
     }
     if (err instanceof NotFoundError) {
       return NextResponse.json({ error: err.message }, { status: 404 });

@@ -8,6 +8,8 @@ import { checkOriginality } from "@/lib/ai/safety";
 import { bookGenerateSchema } from "@/lib/generation/schemas";
 import { enqueueGenerationJob } from "@/lib/generation/jobs";
 
+export const maxDuration = 60;
+
 export async function POST(req: Request) {
   return withApiErrors(async () => {
     const user = await requireUser();

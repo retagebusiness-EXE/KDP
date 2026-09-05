@@ -192,12 +192,15 @@ model UsageRecord {
   @@index([createdAt])
 }
 
+// Export rows are usage metadata only (for plan quotas + admin stats). The
+// rendered PDF bytes themselves are never persisted — see exportInteriorPdf/
+// exportCoverPdf in lib/generation/pipeline.ts, which stream bytes straight
+// back to the requesting HTTP response.
 model Export {
   id               String   @id @default(cuid())
   projectId        String
   project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  type             String // INTERIOR_PDF | COVER_PDF | FULL_PACKAGE
-  filePath         String
+  type             String // INTERIOR_PDF | COVER_PDF
   fileSizeBytes    Int      @default(0)
   validationReport String // JSON-encoded validation report snapshot
   createdAt        DateTime @default(now())

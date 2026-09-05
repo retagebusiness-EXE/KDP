@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { prisma } from "@/lib/db";
-import { runGenerationJob } from "../pipeline";
+import { runGenerationJob, exportInteriorPdf, exportCoverPdf } from "../pipeline";
 
 describe("generation job pipeline (integration, mock AI provider)", () => {
   let userId: string;
@@ -121,14 +121,13 @@ describe("generation job pipeline (integration, mock AI provider)", () => {
     expect(JSON.parse(metadata!.keywords).length).toBeLessThanOrEqual(7);
   }, 15000);
 
-  it("exports a full package (interior + cover PDFs) after validation passes", async () => {
-    const job = await prisma.generationJob.create({
-      data: { projectId, type: "PDF_EXPORT", status: "QUEUED", input: JSON.stringify({ projectId, type: "FULL_PACKAGE" }) },
-    });
-    await runGenerationJob(job.id);
+  it("exports interior and cover PDFs synchronously, in-memory, after validation passes", async () => {
+    const interior = await exportInteriorPdf(projectId);
+    expect(interior.bytes.byteLength).toBeGreaterThan(0);
+    expect(interior.filename).toMatch(/\.pdf$/);
 
-    const finishedJob = await prisma.generationJob.findUniqueOrThrow({ where: { id: job.id } });
-    expect(finishedJob.status).toBe("COMPLETED");
+    const cover = await exportCoverPdf(projectId);
+    expect(cover.bytes.byteLength).toBeGreaterThan(0);
 
     const exports = await prisma.export.findMany({ where: { projectId } });
     expect(exports.length).toBe(2);
