@@ -172,6 +172,7 @@ model GenerationJob {
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   finishedAt DateTime?
+  lockedAt   DateTime? // set while a runGenerationJob invocation is actively working this job; guards against two invocations (e.g. a manual resume racing a stale continuation) running the same job at once
 
   @@index([projectId])
   @@index([status])

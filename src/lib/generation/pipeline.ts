@@ -88,14 +88,32 @@ async function scheduleContinuation(jobId: string): Promise<void> {
   }
 }
 
+// A stale lock means the invocation holding it was hard-killed (Vercel's
+// maxDuration cap leaves no chance to run cleanup code) rather than exited
+// cleanly — well above the 60s invocation ceiling so a live invocation is
+// never mistaken for abandoned.
+const STALE_LOCK_MS = 90_000;
+
 /**
  * Single entry point the job queue calls. Dispatches on `job.type` to the
  * right runner below. A future BullMQ worker would import this same
  * function and call it per job pulled off the Redis queue.
+ *
+ * Both the /continue self-hop and the user-facing manual /resume can end up
+ * targeting the same job (e.g. a click racing a continuation that was only
+ * *reported* as failed), so claim an exclusive lock before doing any work —
+ * otherwise two invocations generate the same next page concurrently and
+ * collide on Page's (bookId, index) unique constraint.
  */
 export async function runGenerationJob(jobId: string): Promise<void> {
   const job = await prisma.generationJob.findUnique({ where: { id: jobId } });
   if (!job) return;
+
+  const claimed = await prisma.generationJob.updateMany({
+    where: { id: jobId, OR: [{ lockedAt: null }, { lockedAt: { lt: new Date(Date.now() - STALE_LOCK_MS) } }] },
+    data: { lockedAt: new Date() },
+  });
+  if (claimed.count === 0) return; // another invocation already holds this job
 
   try {
     switch (job.type) {
@@ -120,6 +138,8 @@ export async function runGenerationJob(jobId: string): Promise<void> {
       error: err instanceof Error ? err.message : "Unknown error during generation.",
       finishedAt: new Date(),
     });
+  } finally {
+    await prisma.generationJob.update({ where: { id: jobId }, data: { lockedAt: null } }).catch(() => {});
   }
 }
 
