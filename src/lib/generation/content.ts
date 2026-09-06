@@ -126,12 +126,13 @@ async function generateWordSearchPage(
   const avoidance = usedWords.length
     ? ` Do not repeat any of these words already used elsewhere in this same book: ${usedWords.join(", ")}.`
     : "";
-  const { data: words, usage } = await ai.generateJSON<string[]>(
+  const { data, usage } = await ai.generateJSON<{ words: string[] }>(
     `Generate ${count} distinct single words or short phrases (3-12 letters, no spaces) related to ` +
       `"${ctx.topic}" for page ${ordinal + 1} of a word search puzzle book aimed at ${ctx.audience}.${avoidance} ` +
-      `Return only the words. ${ORIGINALITY_INSTRUCTION}`,
+      `Return a JSON object of the form {"words": [...]}. ${ORIGINALITY_INSTRUCTION}`,
     { mockKind: "word_list", mockContext: { topic: ctx.topic, count, ordinal, usedWords } }
   );
+  const words = data.words;
 
   const title = `${ctx.topic} #${ordinal + 1}`;
   const { puzzle, solution } = generateWordSearch({ title, words, difficulty, seed });
@@ -158,11 +159,13 @@ async function generateCrosswordPage(
   ai: AIProvider
 ): Promise<GeneratedPage> {
   const count = { EASY: 10, MEDIUM: 14, HARD: 18 }[ctx.difficulty];
-  const { data: words, usage: wordsUsage } = await ai.generateJSON<string[]>(
+  const { data: wordsData, usage: wordsUsage } = await ai.generateJSON<{ words: string[] }>(
     `Generate ${count} distinct single words (4-10 letters) related to "${ctx.topic}" suitable as ` +
-      `crossword answers for puzzle ${ordinal + 1} aimed at ${ctx.audience}. ${ORIGINALITY_INSTRUCTION}`,
+      `crossword answers for puzzle ${ordinal + 1} aimed at ${ctx.audience}. ` +
+      `Return a JSON object of the form {"words": [...]}. ${ORIGINALITY_INSTRUCTION}`,
     { mockKind: "crossword_words", mockContext: { topic: ctx.topic, count, ordinal } }
   );
+  const words = wordsData.words;
 
   const title = `${ctx.topic} Crossword #${ordinal + 1}`;
   const { puzzle, solution } = generateCrosswordLayout({ title, words, difficulty: ctx.difficulty, seed });

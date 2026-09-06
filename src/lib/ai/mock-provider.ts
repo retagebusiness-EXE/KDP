@@ -154,7 +154,7 @@ export class MockProvider implements AIProvider {
         // Bank exhausted (book has more pages than unique bank words) — top up with
         // already-used words rather than erroring; still better than a hard cap.
         const fallback = shuffle(rng, bank.filter((w) => used.has(w)));
-        data = [...fresh, ...fallback].slice(0, Math.min(count, bank.length));
+        data = { words: [...fresh, ...fallback].slice(0, Math.min(count, bank.length)) };
         break;
       }
       case "crossword_clues": {

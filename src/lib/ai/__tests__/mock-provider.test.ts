@@ -7,20 +7,20 @@ describe("MockProvider", () => {
   const provider = new MockProvider();
 
   it("returns topic-relevant words for a known topic", async () => {
-    const { data } = await provider.generateJSON<string[]>("give me words", {
+    const { data } = await provider.generateJSON<{ words: string[] }>("give me words", {
       mockKind: "word_list",
       mockContext: { topic: "Sports", count: 10 },
     });
-    expect(data.length).toBe(10);
-    expect(data.every((w) => /^[A-Z]+$/.test(w))).toBe(true);
+    expect(data.words.length).toBe(10);
+    expect(data.words.every((w) => /^[A-Z]+$/.test(w))).toBe(true);
   });
 
   it("is deterministic for identical prompt+context", async () => {
-    const a = await provider.generateJSON<string[]>("p", {
+    const a = await provider.generateJSON<{ words: string[] }>("p", {
       mockKind: "word_list",
       mockContext: { topic: "Animals", count: 8 },
     });
-    const b = await provider.generateJSON<string[]>("p", {
+    const b = await provider.generateJSON<{ words: string[] }>("p", {
       mockKind: "word_list",
       mockContext: { topic: "Animals", count: 8 },
     });
